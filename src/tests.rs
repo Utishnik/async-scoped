@@ -1,21 +1,21 @@
 macro_rules! test_fixtures {
     ($($item:item)*) => {
         $(
-            #[cfg_attr(feature = "use-async-std", async_std::test)]
-            #[cfg_attr(all(feature = "use-tokio", not( feature = "use-async-std" )), tokio::test(flavor = "multi_thread", worker_threads=1))]
+            #[cfg_attr(feature = "use-smol", smol::test)]
+            #[cfg_attr(all(feature = "use-tokio", not( feature = "use-smol" )), tokio::test(flavor = "multi_thread", worker_threads=1))]
             $item
         )*
     }
 }
 
-cfg_async_std! {
-    use crate::AsyncStdScope as Scope;
+cfg_smol! {
+    use crate::SmolScope as Scope;
 
     fn future_value<T>(v: T) -> T {
         v
     }
 }
-cfg_async_std_or_else! {
+cfg_smol_or_else! {
     use crate::TokioScope as Scope;
 
     fn future_value<T>(v: Result<T, tokio::task::JoinError>) -> T {
@@ -23,7 +23,41 @@ cfg_async_std_or_else! {
     }
 }
 
+
 test_fixtures! {
+    /// Runtime-agnostic timeout: polls `fut` in a task driven by the
+    /// current executor and resolves to `Err(())` when `dur` elapses.
+    async fn timeout<T, F: std::future::Future<Output = T>>(dur: std::time::Duration, fut: F) -> Result<T, ()> {
+        use futures::stream::{Stream, StreamExt};
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct Timeout<F> {
+            deadline: std::time::Instant,
+            fut: Pin<Box<F>>,
+        }
+        impl<F: std::future::Future> Stream for Timeout<F> {
+            type Item = Result<F::Output, ()>;
+            fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                if let Poll::Ready(v) = self.fut.as_mut().poll(cx) {
+                    return Poll::Ready(Some(Ok(v)));
+                }
+                if self.deadline <= std::time::Instant::now() {
+                    return Poll::Ready(Some(Err(())));
+                }
+                Poll::Pending
+            }
+        }
+
+        Timeout {
+            deadline: std::time::Instant::now() + dur,
+            fut: Box::pin(fut),
+        }
+        .next()
+        .await
+        .expect("Timeout stream yields exactly one item")
+    }
+
     async fn test_scope() {
         let not_copy = String::from("hello world!");
         let not_copy_ref = &not_copy;
@@ -76,7 +110,6 @@ test_fixtures! {
         let not_copy_ref = &not_copy;
 
         let stream = unsafe {
-            use async_std::future::{timeout, pending};
             use std::time::Duration;
             let mut s = Scope::create(Default::default());
             for _ in 0..10 {
@@ -84,10 +117,7 @@ test_fixtures! {
                     assert_eq!(not_copy_ref, "hello world!");
                 };
                 s.spawn(proc());
-                let _ = timeout(
-                    Duration::from_millis(10),
-                    pending::<()>(),
-                ).await;
+                let _ = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
             }
             s
         };
@@ -154,15 +184,13 @@ test_fixtures! {
     // Check that a cancellable future works as the
     // contained future under normal circumstances.
     async fn test_cancellation_completeness() {
-        use async_std::future;
         use std::time::*;
 
         // Represents a work future
         async fn proc() -> bool {
-            future::timeout(
-                Duration::from_millis(100),
-                future::pending::<()>(),
-            ).await.is_err()
+            timeout(Duration::from_millis(100), std::future::pending::<()>())
+                .await
+                .is_err()
         }
         let ((), items) = Scope::scope_and_block(|scope| {
             scope.spawn_cancellable(proc(), || false);
@@ -176,15 +204,13 @@ test_fixtures! {
     // Check that a cancellable future works as the
     // contained future under normal circumstances.
     async fn test_cancellation_works() {
-        use async_std::future;
         use std::time::*;
 
         // Represents a work future
         async fn proc() -> bool {
-            future::timeout(
-                Duration::from_millis(10000),
-                future::pending::<()>(),
-            ).await.is_err()
+            timeout(Duration::from_millis(10000), std::future::pending::<()>())
+                .await
+                .is_err()
         }
         let ((), items) = Scope::scope_and_block(|scope| {
             scope.spawn_cancellable(proc(), || false);
@@ -205,7 +231,6 @@ test_fixtures! {
     //
     // [reddit-ref]: https://www.reddit.com/r/rust/comments/ee3vsu/asyncscoped_spawn_non_static_futures_with_asyncstd/fbpis3c?utm_source=share&utm_medium=web2x
     async fn test_cancellation_soundness() {
-        use async_std::future;
         use std::time::*;
 
         async fn inner() {
@@ -217,10 +242,9 @@ test_fixtures! {
             let mut fut = Box::pin(
                 unsafe { Scope::scope_and_collect(|scope| {
                     scope.spawn_cancellable(async {
-                        assert!(future::timeout(
-                            Duration::from_millis(500),
-                            future::pending::<()>(),
-                        ).await.is_err());
+                        assert!(timeout(Duration::from_millis(500), std::future::pending::<()>())
+                            .await
+                            .is_err());
 
                         eprintln!("Trying to write to shared_ref");
                         *shared_ref = false;
@@ -228,7 +252,7 @@ test_fixtures! {
                     }, || ());
                 })}
             );
-            let _ = future::timeout(Duration::from_millis(10), &mut fut).await;
+            let _ = timeout(Duration::from_millis(10), &mut fut).await;
 
             // Dropping explicitly to measure time taken to complete drop.
             // Change the drop to forget for panic due to invalid mem. access.
@@ -246,8 +270,9 @@ test_fixtures! {
 
         // This timeout allows any (possible) invalid memory
         // access to actually take place.
-        assert!(future::timeout(Duration::from_millis(600),
-                                future::pending::<()>()).await.is_err());
+        assert!(timeout(Duration::from_millis(600), std::future::pending::<()>())
+            .await
+            .is_err());
 
     }
 
@@ -262,12 +287,8 @@ test_fixtures! {
                 let blob = vec![42u8; 0x10000000];
 
                 // Spend a lot of time on it asynchronously
-                use async_std::future;
                 use std::time::Duration;
-                let _ = future::timeout(
-                    Duration::from_millis(100),
-                    future::pending::<()>()
-                ).await;
+                let _ = timeout(Duration::from_millis(100), std::future::pending::<()>()).await;
 
                 std::mem::drop(blob);
             });
@@ -282,7 +303,7 @@ test_fixtures! {
 
     // Mutability test: should fail to compile.
     // TODO: use compiletest_rs
-    // #[async_std::test]
+    // #[smol::test]
     // async fn mutating_scope() {
     //     let mut not_copy = String::from("hello world!");
     //     let not_copy_ref = &mut not_copy;
@@ -326,16 +347,16 @@ test_fixtures! {
     }
 
     async fn test_ordered_collect() {
-        use std::future::pending;
         const N: u64 = 10;
 
         let (_, r) = Scope::scope_and_block(|scope| {
             for i in 0..N {
                 scope.spawn(async move {
-                    let _ = async_std::future::timeout(
+                    let _ = timeout(
                         std::time::Duration::from_millis(100 - i),
-                        pending::<()>()
-                    ).await;
+                        std::future::pending::<()>(),
+                    )
+                    .await;
                     i
                 });
             }
@@ -406,4 +427,87 @@ fn test_empty_scope() {
     }
 
     let _ = unsafe { crate::Scope::<(), _>::create(PanickingSpawner) };
+}
+
+#[cfg(all(test, feature = "use-compio", unix))]
+mod use_compio {
+    use crate::CompioScope as Scope;
+
+    fn future_value<T>(v: Result<T, async_executor::TaskError>) -> T {
+        v.expect("join error while unwrapping value")
+    }
+
+    #[compio::test]
+    async fn test_scope_and_block() {
+        let not_copy = String::from("hello world!");
+        let not_copy_ref = &not_copy;
+
+        let ((), vals) = Scope::scope_and_block(|s| {
+            for _ in 0..10 {
+                let proc = || async {
+                    assert_eq!(not_copy_ref, "hello world!");
+                };
+                s.spawn(proc());
+            }
+        });
+
+        assert_eq!(vals.len(), 10);
+    }
+
+    #[compio::test]
+    async fn test_scope_and_collect() {
+        let not_copy = String::from("hello world!");
+        let not_copy_ref = &not_copy;
+
+        let (_, vals) = unsafe {
+            Scope::scope_and_collect(|s| {
+                for _ in 0..10 {
+                    let proc = || async {
+                        assert_eq!(not_copy_ref, "hello world!");
+                    };
+                    s.spawn(proc());
+                }
+            })
+        }
+        .await;
+
+        assert_eq!(vals.len(), 10);
+    }
+
+    #[compio::test]
+    async fn test_spawn_blocking_func() {
+        let not_copy = String::from("hello world!");
+        let not_copy_ref = &not_copy;
+
+        let ((), vals) = Scope::scope_and_block(|s| {
+            for _ in 0..10 {
+                let proc = || {
+                    assert_eq!(not_copy_ref, "hello world!");
+                };
+                s.spawn_blocking(proc);
+            }
+        });
+
+        assert_eq!(vals.len(), 10);
+    }
+
+    #[compio::test]
+    async fn test_cancellation_works() {
+        use std::time::*;
+
+        // Represents a work future
+        async fn proc() -> bool {
+            timeout(Duration::from_millis(10000), std::future::pending::<()>())
+                .await
+                .is_err()
+        }
+        let ((), items) = Scope::scope_and_block(|scope| {
+            scope.spawn_cancellable(proc(), || false);
+            scope.cancel();
+        });
+        assert_eq!(items.len(), 1);
+        for i in items {
+            assert_eq!(future_value(i), false);
+        }
+    }
 }

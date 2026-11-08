@@ -1,11 +1,11 @@
 //! Enables controlled spawning of non-`'static` futures
-//! when using the [async-std] or [tokio]
+//! when using the [smol], [tokio] or [compio]
 //! executors. Note that this idea is similar to
 //! `crossbeam::scope`, and `rayon::scope` but asynchronous.
 //!
 //! ## Motivation
 //!
-//! Executors like async_std, tokio, etc. support spawning
+//! Executors like smol, tokio, compio, etc. support spawning
 //! `'static` futures onto a thread-pool. However, it is
 //! often useful to spawn futures that may not be `'static`.
 //!
@@ -37,7 +37,7 @@
 //! async fn scoped_futures() {
 //!     let not_copy = String::from("hello world!");
 //!     let not_copy_ref = &not_copy;
-//!     let (foo, outputs) = async_scoped::AsyncStdScope::scope_and_block(|s| {
+//!     let (foo, outputs) = async_scoped::SmolScope::scope_and_block(|s| {
 //!         for _ in 0..10 {
 //!             let proc = || async {
 //!                 assert_eq!(not_copy_ref, "hello world!");
@@ -64,13 +64,13 @@
 //!
 //! ## Executor Selection
 //!
-//! Users may use "use-async-std", or the
-//! "use-tokio" features to enable specific executor implementations.
+//! Users may use "use-smol", "use-tokio", or the
+//! "use-compio" features to enable specific executor implementations.
 //! Those are not necessary, you may freely implement traits `Spawner`, `Blocker`, etc for your own
 //! runtime. Just ensure you follow the safety idea.
 //!
 //! Some notes on default implementations:
-//! 1. [`AsyncScope`] may run into a dead-lock if used in
+//! 1. [`SmolScope`] may run into a dead-lock if used in
 //! deep recursions (depth > #num-cores / 2).
 //!
 //! 2. [`TokioScope::scope_and_block`][Scope::scope_and_block] may only be used
@@ -132,8 +132,9 @@
 //! method is allowed in safe Rust, the purely asynchronous
 //! API here is _inherently unsafe_.
 //!
-//! [async-std]: /async_std
+//! [smol]: /smol
 //! [tokio]: /tokio
+//! [compio]: /compio
 //! [poll]: std::futures::Future::poll
 //! [Task]: std::task
 //! [forget]: std::mem::forget
@@ -149,8 +150,11 @@ pub use scoped::Scope;
 #[cfg(feature = "use-tokio")]
 pub type TokioScope<'a, T> = Scope<'a, T, spawner::use_tokio::Tokio>;
 
-#[cfg(feature = "use-async-std")]
-pub type AsyncStdScope<'a, T> = Scope<'a, T, spawner::use_async_std::AsyncStd>;
+#[cfg(feature = "use-smol")]
+pub type SmolScope<'a, T> = Scope<'a, T, spawner::use_smol::Smol>;
+
+#[cfg(all(feature = "use-compio", unix))]
+pub type CompioScope<'a, T> = Scope<'a, T, spawner::use_compio::Compio>;
 
 pub mod spawner;
 mod usage;

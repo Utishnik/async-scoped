@@ -19,33 +19,41 @@ pub unsafe trait Blocker {
     fn block_on<T, F: Future<Output = T>>(&self, f: F) -> T;
 }
 
-#[cfg(feature = "use-async-std")]
-pub mod use_async_std {
+#[cfg(feature = "use-smol")]
+pub mod use_smol {
     use super::*;
-    use async_std::task::{block_on, spawn, spawn_blocking, JoinHandle};
+    use smol::{spawn, Task};
+
+    thread_local! {
+        /// `smol` does not provide an async-std-like blocking pool out of
+        /// the box, so we back `spawn_func` with a lazily initialized
+        /// `futures` thread pool.
+        static BLOCKING_POOL: futures::executor::ThreadPool =
+            futures::executor::ThreadPool::new();
+    }
 
     #[derive(Default)]
-    pub struct AsyncStd;
+    pub struct Smol;
 
-    unsafe impl<T: Send + 'static> Spawner<T> for AsyncStd {
+    unsafe impl<T: Send + 'static> Spawner<T> for Smol {
         type FutureOutput = T;
-        type SpawnHandle = JoinHandle<T>;
+        type SpawnHandle = Task<T>;
 
         fn spawn<F: Future<Output = T> + Send + 'static>(&self, f: F) -> Self::SpawnHandle {
             spawn(f)
         }
     }
-    unsafe impl<T: Send + 'static> FuncSpawner<T> for AsyncStd {
+    unsafe impl<T: Send + 'static> FuncSpawner<T> for Smol {
         type FutureOutput = T;
-        type SpawnHandle = JoinHandle<T>;
+        type SpawnHandle = Task<T>;
 
         fn spawn_func<F: FnOnce() -> T + Send + 'static>(&self, f: F) -> Self::SpawnHandle {
-            spawn_blocking(f)
+            BLOCKING_POOL.with(|pool| pool.spawn_with_handle(f).expect("failed to spawn blocking function"))
         }
     }
-    unsafe impl Blocker for AsyncStd {
+    unsafe impl Blocker for Smol {
         fn block_on<T, F: Future<Output = T>>(&self, f: F) -> T {
-            block_on(f)
+            smol::block_on(f)
         }
     }
 }
@@ -84,6 +92,42 @@ pub mod use_tokio {
                     .unwrap()
                     .block_on(f)
             })
+        }
+    }
+}
+
+#[cfg(all(feature = "use-compio", unix))]
+pub mod use_compio {
+    use super::*;
+    use compio::{block_on, spawn};
+
+    #[derive(Default)]
+    pub struct Compio;
+
+    unsafe impl<T: Send + 'static> Spawner<T> for Compio {
+        type FutureOutput = std::result::Result<T, async_executor::TaskError>;
+        type SpawnHandle = compio::runtime::JoinHandle<T>;
+
+        fn spawn<F: Future<Output = T> + Send + 'static>(&self, f: F) -> Self::SpawnHandle {
+            spawn(f)
+        }
+    }
+
+    unsafe impl<T: Send + 'static> FuncSpawner<T> for Compio {
+        type FutureOutput = T;
+        type SpawnHandle = futures::future::Ready<T>;
+
+        fn spawn_func<F: FnOnce() -> T + Send + 'static>(&self, f: F) -> Self::SpawnHandle {
+            // `compio` runs on a single-threaded runtime, so there is no
+            // thread pool to offload a blocking function onto. Run it
+            // eagerly and wrap the result in a ready future.
+            futures::future::ready(f())
+        }
+    }
+
+    unsafe impl Blocker for Compio {
+        fn block_on<T, F: Future<Output = T>>(&self, f: F) -> T {
+            block_on(f)
         }
     }
 }
