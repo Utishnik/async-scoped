@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- Replaced the `async-std` backend with `smol`: the `use-async-std`
+  feature has been renamed to `use-smol`, and `AsyncStdScope` to
+  `SmolScope`.
+
+### Added
+
+- Added experimental `compio` support via the new `use-compio`
+  feature and the `CompioScope` type (Unix only).
+
 ## [0.9.0] - 2024-01-24
 
 - Use `FuturesOrdered` inside `Scope`. [#19](https://github.com/rmanoka/async-scoped/pull/19)
