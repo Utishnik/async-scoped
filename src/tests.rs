@@ -1,11 +1,43 @@
 macro_rules! test_fixtures {
-    ($($item:item)*) => {
-        $(
-            #[cfg_attr(feature = "use-smol", smol::test)]
-            #[cfg_attr(all(feature = "use-tokio", not( feature = "use-smol" )), tokio::test(flavor = "multi_thread", worker_threads=1))]
-            $item
-        )*
-    }
+    // Паттерн 1: Тестовые функции.
+    // Они строго имеют пустые скобки `()` после имени.
+    (
+        $(#[$meta:meta])*
+        async fn $name:ident () $body:block
+        $($rest:tt)*
+    ) => {
+        #[cfg(feature = "use-smol")]
+        smol_blocking_test! {
+            $(#[$meta])*
+            async fn $name() $body
+        }
+
+        #[cfg(all(feature = "use-tokio", not(feature = "use-smol")))]
+        $(#[$meta])*
+        #[tokio::test(flavor = "multi_thread", worker_threads=1)]
+        async fn $name() $body
+
+        // Рекурсивный вызов для обработки остальных элементов
+        test_fixtures! { $($rest)* }
+    };
+
+    // Паттерн 2: Хелпер-функции (и всё остальное).
+    // Если функция не подошла под Паттерн 1 (т.е. у неё есть `<...>` или аргументы),
+    // мы просто захватываем её целиком как `item` и выводим без изменений.
+    (
+        $(#[$meta:meta])*
+        $item:item
+        $($rest:tt)*
+    ) => {
+        $(#[$meta])*
+        $item
+
+        // Рекурсивный вызов
+        test_fixtures! { $($rest)* }
+    };
+
+    // Базовый случай (конец списка)
+    () => {};
 }
 
 cfg_smol! {
@@ -23,10 +55,9 @@ cfg_smol_or_else! {
     }
 }
 
-
+/// Runtime-agnostic timeout: polls `fut` in a task driven by the
+/// current executor and resolves to `Err(())` when `dur` elapses.
 test_fixtures! {
-    /// Runtime-agnostic timeout: polls `fut` in a task driven by the
-    /// current executor and resolves to `Err(())` when `dur` elapses.
     async fn timeout<T, F: std::future::Future<Output = T>>(dur: std::time::Duration, fut: F) -> Result<T, ()> {
         use futures::stream::{Stream, StreamExt};
         use std::pin::Pin;

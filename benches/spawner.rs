@@ -13,9 +13,7 @@ fn spawn_and_collect<Sp: Spawner<usize> + Blocker>(s: &mut Scope<usize, Sp>) {
         let delay = i & MAX_DELAY;
         s.spawn(async move {
             let _ = pending::<()>()
-                .timeout(std::time::Duration::from_millis(
-                    (MAX_DELAY - delay) as u64,
-                ))
+                .timeout(std::time::Duration::from_millis((MAX_DELAY - delay) as u64))
                 .await;
             i
         });

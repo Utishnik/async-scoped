@@ -1,6 +1,7 @@
 //! There you can find traits that are necessary for implementing executor.
 //! They are mostly unsafe, as we can't ensure the executor allows intended manipulations
 //! without causing UB.
+use futures::task::SpawnExt;
 use futures::Future;
 
 pub unsafe trait Spawner<T> {
@@ -29,7 +30,7 @@ pub mod use_smol {
         /// the box, so we back `spawn_func` with a lazily initialized
         /// `futures` thread pool.
         static BLOCKING_POOL: futures::executor::ThreadPool =
-            futures::executor::ThreadPool::new();
+            futures::executor::ThreadPool::new().unwrap();
     }
 
     #[derive(Default)]
@@ -48,7 +49,10 @@ pub mod use_smol {
         type SpawnHandle = Task<T>;
 
         fn spawn_func<F: FnOnce() -> T + Send + 'static>(&self, f: F) -> Self::SpawnHandle {
-            BLOCKING_POOL.with(|pool| pool.spawn_with_handle(f).expect("failed to spawn blocking function"))
+            BLOCKING_POOL.with(|pool| {
+                pool.spawn_with_handle(f)
+                    .expect("failed to spawn blocking function")
+            })
         }
     }
     unsafe impl Blocker for Smol {
