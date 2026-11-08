@@ -96,38 +96,61 @@ pub mod use_tokio {
     }
 }
 
-#[cfg(all(feature = "use-compio", unix))]
+#[cfg(feature = "use-compio")]
 pub mod use_compio {
     use super::*;
-    use compio::{block_on, spawn};
+    use compio::runtime::{spawn, spawn_blocking, Task};
+
+    /// The output of a spawned compio task: the value itself, or
+    /// `Err` if the task panicked (carrying the panic payload).
+    pub type TaskResult<T> = std::result::Result<T, std::any::Any>;
 
     #[derive(Default)]
     pub struct Compio;
 
     unsafe impl<T: Send + 'static> Spawner<T> for Compio {
-        type FutureOutput = std::result::Result<T, async_executor::TaskError>;
-        type SpawnHandle = compio::runtime::JoinHandle<T>;
+        type FutureOutput = std::result::Result<T, TaskResult<std::any::Any>>;
+        type SpawnHandle = Task<std::result::Result<T, TaskResult<std::any::Any>>>;
 
         fn spawn<F: Future<Output = T> + Send + 'static>(&self, f: F) -> Self::SpawnHandle {
-            spawn(f)
+            // `compio` spawns tasks onto the current (single-threaded)
+            // runtime. The futures we spawn are boxed as `dyn Future +
+            // Send`, which compio accepts (it simply drives them on the
+            // current thread). compio's own `spawn` wraps the future in
+            // `AssertUnwindSafe(fut).catch_unwind()` and returns a
+            // `JoinHandle<T> = Task<Result<T, Box<dyn Any + Send>>>`.
+            // We map that into our error type here instead of leaking
+            // `Box<dyn Any>` out of this module.
+            spawn(f).map(|res| res.map_err(|e| Err(e)))
         }
     }
 
     unsafe impl<T: Send + 'static> FuncSpawner<T> for Compio {
-        type FutureOutput = T;
-        type SpawnHandle = futures::future::Ready<T>;
+        type FutureOutput = std::result::Result<T, TaskResult<std::any::Any>>;
+        type SpawnHandle = Task<std::result::Result<T, TaskResult<std::any::Any>>>;
 
         fn spawn_func<F: FnOnce() -> T + Send + 'static>(&self, f: F) -> Self::SpawnHandle {
-            // `compio` runs on a single-threaded runtime, so there is no
-            // thread pool to offload a blocking function onto. Run it
-            // eagerly and wrap the result in a ready future.
-            futures::future::ready(f())
+            // `compio` provides `spawn_blocking`, which runs the closure
+            // on a dedicated thread and delivers the result back to the
+            // runtime asynchronously.
+            spawn_blocking(f).map(|res| res.map_err(|e| Err(e)))
         }
     }
 
     unsafe impl Blocker for Compio {
         fn block_on<T, F: Future<Output = T>>(&self, f: F) -> T {
-            block_on(f)
+            // If we are already inside a compio runtime, drive `f` as a
+            // task on it. Otherwise, create a fresh runtime to block on
+            // `f`.
+            match compio::runtime::Runtime::try_with_current(|rt| {
+                let handle = rt.spawn(f);
+                rt.block_on(handle).expect("the spawned future panicked")
+            }) {
+                Ok(v) => v,
+                Err(f) => compio::runtime::Runtime::new()
+                    .expect("failed to create compio runtime")
+                    .block_on(f),
+            }
         }
     }
 }
