@@ -13,7 +13,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Added experimental `compio` support via the new `use-compio`
-  feature and the `CompioScope` type (Unix only).
+  feature and the `CompioScope` type (cross-platform).
 
 ## [0.9.0] - 2024-01-24
 

@@ -18,8 +18,9 @@
 //! ## Scope API
 //!
 //! We propose an API similar to
-//! [`crossbeam::scope`](crossbeam::scope) to allow spawning
-//! futures that are not `'static`. The key API is approximately:
+//! [`crossbeam::scope`](https://docs.rs/crossbeam) to allow
+//! spawning futures that are not `'static`. The key API is
+//! approximately:
 //!
 //! ``` rust, ignore
 //! pub unsafe fn scope<'a, T: Send + 'static,
@@ -70,7 +71,7 @@
 //! runtime. Just ensure you follow the safety idea.
 //!
 //! Some notes on default implementations:
-//! 1. [`SmolScope`] may run into a dead-lock if used in
+//! 1. `SmolScope` may run into a dead-lock if used in
 //! deep recursions (depth > #num-cores / 2).
 //!
 //! 2. [`TokioScope::scope_and_block`][Scope::scope_and_block] may only be used
@@ -125,24 +126,19 @@
 //! stream is not forgotten.
 //!
 //! For soundness, we drive the stream to completion in the
-//! [`Drop`][Drop] impl. The current thread is blocked until
-//! the stream is fully driven.
+//! [`Drop`] impl. The current thread is blocked until the
+//! stream is fully driven.
 //!
-//! Unfortunately, since the [`std::mem::forget`][forget]
-//! method is allowed in safe Rust, the purely asynchronous
-//! API here is _inherently unsafe_.
+//! Unfortunately, since the [`std::mem::forget`] method is
+//! allowed in safe Rust, the purely asynchronous API here is
+//! _inherently unsafe_.
 //!
 //! [smol]: /smol
 //! [tokio]: /tokio
 //! [compio]: /compio
-//! [poll]: std::futures::Future::poll
 //! [Task]: std::task
-//! [forget]: std::mem::forget
 //! [Stream]: futures::Stream
 //! [for_each_concurrent]: futures::StreamExt::for_each_concurrent
-
-#[macro_use]
-mod utils;
 
 mod scoped;
 pub use scoped::Scope;
@@ -153,7 +149,7 @@ pub type TokioScope<'a, T> = Scope<'a, T, spawner::use_tokio::Tokio>;
 #[cfg(feature = "use-smol")]
 pub type SmolScope<'a, T> = Scope<'a, T, spawner::use_smol::Smol>;
 
-#[cfg(all(feature = "use-compio", unix))]
+#[cfg(feature = "use-compio")]
 pub type CompioScope<'a, T> = Scope<'a, T, spawner::use_compio::Compio>;
 
 pub mod spawner;

@@ -16,7 +16,15 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build
+    - name: Build (no spawner features)
       run: cargo build --verbose
-    - name: Run tests
+    - name: Run tests (no spawner features)
       run: cargo test --verbose
+    - name: Run tests (tokio)
+      run: cargo test --verbose --features use-tokio
+    - name: Run tests (smol)
+      run: cargo test --verbose --features use-smol
+    - name: Run tests (compio)
+      run: cargo test --verbose --features use-compio
+    - name: Check all targets with every feature combination
+      run: cargo check --workspace --all-targets --verbose

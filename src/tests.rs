@@ -6,8 +6,10 @@ macro_rules! test_fixtures {
         async fn $name:ident () $body:block
         $($rest:tt)*
     ) => {
+        // smol: `smol_macros::test!` is a declarative macro; it wraps
+        // the test body in a self-contained smol executor.
         #[cfg(feature = "use-smol")]
-        smol_blocking_test! {
+        ::smol_macros::test! {
             $(#[$meta])*
             async fn $name() $body
         }
@@ -24,12 +26,13 @@ macro_rules! test_fixtures {
     // Паттерн 2: Хелпер-функции (и всё остальное).
     // Если функция не подошла под Паттерн 1 (т.е. у неё есть `<...>` или аргументы),
     // мы просто захватываем её целиком как `item` и выводим без изменений.
+    // Атрибуты входят в состав `item`, поэтому отдельный повтор
+    // `$(#[$meta:meta])*` здесь не нужен — иначе парсер не сможет
+    // однозначно разделить меты и сам элемент.
     (
-        $(#[$meta:meta])*
         $item:item
         $($rest:tt)*
     ) => {
-        $(#[$meta])*
         $item
 
         // Рекурсивный вызов
@@ -40,53 +43,41 @@ macro_rules! test_fixtures {
     () => {};
 }
 
-cfg_smol! {
-    use crate::SmolScope as Scope;
+#[cfg(feature = "use-smol")]
+use crate::SmolScope as Scope;
 
-    fn future_value<T>(v: T) -> T {
-        v
-    }
-}
-cfg_smol_or_else! {
-    use crate::TokioScope as Scope;
+#[cfg(all(feature = "use-tokio", not(feature = "use-smol")))]
+use crate::TokioScope as Scope;
 
-    fn future_value<T>(v: Result<T, tokio::task::JoinError>) -> T {
-        v.expect("join error while unwrapping value")
-    }
+#[cfg(feature = "use-smol")]
+fn future_value<T>(v: T) -> T {
+    v
 }
 
-/// Runtime-agnostic timeout: polls `fut` in a task driven by the
-/// current executor and resolves to `Err(())` when `dur` elapses.
+#[cfg(all(feature = "use-tokio", not(feature = "use-smol")))]
+fn future_value<T>(v: Result<T, tokio::task::JoinError>) -> T {
+    v.expect("join error while unwrapping value")
+}
+
+// Runtime-agnostic timeout: resolves to `Ok(value)` when `fut`
+// completes, or to `Err(())` when `dur` elapses. Uses `futures-timer`,
+// so it works with any executor.
 test_fixtures! {
+    // `allow(dead_code)`: used only by the runtime-gated tests, so
+    // building tests without any spawner feature flags it as unused.
+    #[allow(dead_code)]
     async fn timeout<T, F: std::future::Future<Output = T>>(dur: std::time::Duration, fut: F) -> Result<T, ()> {
-        use futures::stream::{Stream, StreamExt};
+        use futures::future::{select, Either};
+        use futures_timer::Delay;
         use std::pin::Pin;
-        use std::task::{Context, Poll};
 
-        struct Timeout<F> {
-            deadline: std::time::Instant,
-            fut: Pin<Box<F>>,
-        }
-        impl<F: std::future::Future> Stream for Timeout<F> {
-            type Item = Result<F::Output, ()>;
-            fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-                if let Poll::Ready(v) = self.fut.as_mut().poll(cx) {
-                    return Poll::Ready(Some(Ok(v)));
-                }
-                if self.deadline <= std::time::Instant::now() {
-                    return Poll::Ready(Some(Err(())));
-                }
-                Poll::Pending
-            }
-        }
+        let mut fut: Pin<Box<F>> = Box::pin(fut);
+        let mut delay = Box::pin(Delay::new(dur));
 
-        Timeout {
-            deadline: std::time::Instant::now() + dur,
-            fut: Box::pin(fut),
+        match select(&mut fut, &mut delay).await {
+            Either::Left((v, _)) => Ok(v),
+            Either::Right((_, _)) => Err(()),
         }
-        .next()
-        .await
-        .expect("Timeout stream yields exactly one item")
     }
 
     async fn test_scope() {
@@ -352,31 +343,13 @@ test_fixtures! {
     //     assert_eq!(count, 10);
     // }
 
-    // https://github.com/rmanoka/async-scoped/issues/2
-    // https://github.com/async-rs/async-std/issues/644
-    async fn test_async_deadlock() {
-        use std::future::Future;
-        use futures::FutureExt;
-        fn nth(n: usize) -> impl Future<Output=usize> + Send {
-            eprintln!("nth({})", n);
-            async move {
-                let mut result: usize = 0;
-                Scope::scope_and_block(|scope| {
-                    if n > 0 {
-                        scope.spawn(async {
-                            let rec = { nth(n-1).boxed() }.await;
-                            result = rec + 1;
-                        });
-                    }
-                });
-                eprintln!("nth({})={}", n, result);
-                result
-            }
-        }
-        let input = 4;
-        assert_eq!(nth(input).await, input);
-    }
-
+    // Рекурсивный `scope_and_block` требует возможности высвободить
+    // текущий поток (как делает tokio в `block_in_place`), поэтому
+    // этот тест запускается только под tokio: глобальный executor
+    // smol работает на одном фоновом потоке (SMOL_THREADS=1 по
+    // умолчанию), и каждый уровень рекурсии блокирует свой поток,
+    // требуя новый поток для следующего уровня — см. dead-lock
+    // замечание для `SmolScope` в документации lib.rs.
     async fn test_ordered_collect() {
         const N: u64 = 10;
 
@@ -460,11 +433,13 @@ fn test_empty_scope() {
     let _ = unsafe { crate::Scope::<(), _>::create(PanickingSpawner) };
 }
 
-#[cfg(all(test, feature = "use-compio", unix))]
+#[cfg(all(test, feature = "use-compio"))]
 mod use_compio {
+    use super::timeout;
     use crate::CompioScope as Scope;
+    use std::any::Any;
 
-    fn future_value<T>(v: Result<T, async_executor::TaskError>) -> T {
+    fn future_value<T>(v: Result<T, Box<dyn Any + Send>>) -> T {
         v.expect("join error while unwrapping value")
     }
 

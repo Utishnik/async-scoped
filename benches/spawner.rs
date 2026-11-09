@@ -1,20 +1,22 @@
+// Only referenced from the runtime-gated branches of `main`.
+#[cfg(any(feature = "use-tokio", feature = "use-smol"))]
 use async_scoped::{
     spawner::{Blocker, Spawner},
     Scope,
 };
-use futures::future::pending;
-use futures::FutureExt;
+#[cfg(any(feature = "use-tokio", feature = "use-smol"))]
+use futures_timer::Delay;
 use std::hint::black_box;
 
+// Only referenced from the runtime-gated branches of `main`.
+#[cfg(any(feature = "use-tokio", feature = "use-smol"))]
 fn spawn_and_collect<Sp: Spawner<usize> + Blocker>(s: &mut Scope<usize, Sp>) {
     const INPUT_SIZE: usize = 1000000;
     const MAX_DELAY: usize = 1 << 8;
     for i in 0..INPUT_SIZE {
         let delay = i & MAX_DELAY;
         s.spawn(async move {
-            let _ = pending::<()>()
-                .timeout(std::time::Duration::from_millis((MAX_DELAY - delay) as u64))
-                .await;
+            let _ = Delay::new(std::time::Duration::from_millis((MAX_DELAY - delay) as u64)).await;
             i
         });
     }
@@ -44,6 +46,14 @@ fn main() {
 
                     r
                 })
+        }
+        #[cfg(not(any(feature = "use-tokio", feature = "use-smol")))]
+        {
+            eprintln!(
+                "the `spawner` benchmark requires the `use-tokio` or \
+                 `use-smol` feature"
+            );
+            Vec::<usize>::new()
         }
     };
 

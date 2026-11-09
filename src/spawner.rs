@@ -1,7 +1,6 @@
 //! There you can find traits that are necessary for implementing executor.
 //! They are mostly unsafe, as we can't ensure the executor allows intended manipulations
 //! without causing UB.
-use futures::task::SpawnExt;
 use futures::Future;
 
 pub unsafe trait Spawner<T> {
@@ -25,14 +24,6 @@ pub mod use_smol {
     use super::*;
     use smol::{spawn, Task};
 
-    thread_local! {
-        /// `smol` does not provide an async-std-like blocking pool out of
-        /// the box, so we back `spawn_func` with a lazily initialized
-        /// `futures` thread pool.
-        static BLOCKING_POOL: futures::executor::ThreadPool =
-            futures::executor::ThreadPool::new().unwrap();
-    }
-
     #[derive(Default)]
     pub struct Smol;
 
@@ -44,14 +35,24 @@ pub mod use_smol {
             spawn(f)
         }
     }
+
     unsafe impl<T: Send + 'static> FuncSpawner<T> for Smol {
         type FutureOutput = T;
         type SpawnHandle = Task<T>;
 
         fn spawn_func<F: FnOnce() -> T + Send + 'static>(&self, f: F) -> Self::SpawnHandle {
-            BLOCKING_POOL.with(|pool| {
-                pool.spawn_with_handle(f)
-                    .expect("failed to spawn blocking function")
+            // `smol` does not provide an async-std-like blocking pool
+            // out of the box, so run the closure on a dedicated thread
+            // and deliver the result through a one-shot channel. The
+            // handle is a regular `smol` task that only waits on the
+            // channel, never on the blocking work itself.
+            let (tx, rx) = futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(f());
+            });
+            spawn(async move {
+                rx.await
+                    .expect("blocking function panicked or thread was dropped")
             })
         }
     }
@@ -106,54 +107,50 @@ pub mod use_compio {
     use compio::runtime::{spawn, spawn_blocking, Task};
 
     /// The output of a spawned compio task: the value itself, or
-    /// `Err` if the task panicked (carrying the panic payload).
-    pub type TaskResult<T> = std::result::Result<T, std::any::Any>;
+    /// `Err` carrying the panic payload if the task panicked.
+    pub type TaskResult<T> =
+        std::result::Result<T, std::boxed::Box<dyn std::any::Any + std::marker::Send>>;
 
     #[derive(Default)]
     pub struct Compio;
 
     unsafe impl<T: Send + 'static> Spawner<T> for Compio {
-        type FutureOutput = std::result::Result<T, TaskResult<std::any::Any>>;
-        type SpawnHandle = Task<std::result::Result<T, TaskResult<std::any::Any>>>;
+        type FutureOutput = TaskResult<T>;
+        type SpawnHandle = Task<TaskResult<T>>;
 
         fn spawn<F: Future<Output = T> + Send + 'static>(&self, f: F) -> Self::SpawnHandle {
-            // `compio` spawns tasks onto the current (single-threaded)
-            // runtime. The futures we spawn are boxed as `dyn Future +
-            // Send`, which compio accepts (it simply drives them on the
-            // current thread). compio's own `spawn` wraps the future in
-            // `AssertUnwindSafe(fut).catch_unwind()` and returns a
-            // `JoinHandle<T> = Task<Result<T, Box<dyn Any + Send>>>`.
-            // We map that into our error type here instead of leaking
-            // `Box<dyn Any>` out of this module.
-            spawn(f).map(|res| res.map_err(|e| Err(e)))
+            // compio wraps the future in `AssertUnwindSafe(f).catch_unwind()`
+            // and returns a `JoinHandle<T> = Task<Result<T, Box<dyn Any +
+            // Send>>>`, so the handle already yields the task's output or
+            // its panic payload; no further wrapping is needed.
+            spawn(f)
         }
     }
 
     unsafe impl<T: Send + 'static> FuncSpawner<T> for Compio {
-        type FutureOutput = std::result::Result<T, TaskResult<std::any::Any>>;
-        type SpawnHandle = Task<std::result::Result<T, TaskResult<std::any::Any>>>;
+        type FutureOutput = TaskResult<T>;
+        type SpawnHandle = Task<TaskResult<T>>;
 
         fn spawn_func<F: FnOnce() -> T + Send + 'static>(&self, f: F) -> Self::SpawnHandle {
             // `compio` provides `spawn_blocking`, which runs the closure
             // on a dedicated thread and delivers the result back to the
             // runtime asynchronously.
-            spawn_blocking(f).map(|res| res.map_err(|e| Err(e)))
+            spawn_blocking(f)
         }
     }
 
     unsafe impl Blocker for Compio {
         fn block_on<T, F: Future<Output = T>>(&self, f: F) -> T {
-            // If we are already inside a compio runtime, drive `f` as a
-            // task on it. Otherwise, create a fresh runtime to block on
-            // `f`.
-            match compio::runtime::Runtime::try_with_current(|rt| {
-                let handle = rt.spawn(f);
-                rt.block_on(handle).expect("the spawned future panicked")
-            }) {
+            // If we are already inside a compio runtime, drive `f` on it.
+            // Otherwise `try_with_current` hands the closure back in `Err`,
+            // and we create a fresh runtime to run it on.
+            match compio::runtime::Runtime::try_with_current(|rt| rt.block_on(f)) {
                 Ok(v) => v,
-                Err(f) => compio::runtime::Runtime::new()
-                    .expect("failed to create compio runtime")
-                    .block_on(f),
+                Err(run) => {
+                    let rt =
+                        compio::runtime::Runtime::new().expect("failed to create compio runtime");
+                    run(&rt)
+                }
             }
         }
     }
