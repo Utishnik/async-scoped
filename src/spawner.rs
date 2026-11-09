@@ -91,12 +91,25 @@ pub mod use_tokio {
 
     unsafe impl Blocker for Tokio {
         fn block_on<T, F: Future<Output = T>>(&self, f: F) -> T {
-            tokio_task::block_in_place(|| {
-                tokio::runtime::Builder::new_current_thread()
+            use tokio::runtime::{Handle, RuntimeFlavor};
+            // Prefer blocking on the *current* multi-threaded runtime:
+            // `block_in_place` releases the current worker (letting the
+            // other workers admit tasks), and blocking on the same
+            // runtime avoids the cross-runtime wake-up hops that made
+            // driving ~1e6 `JoinHandle`s orders of magnitude slower
+            // (one park/unpark round-trip per completed future).
+            match Handle::try_current() {
+                Ok(handle) if handle.runtime_flavor() != RuntimeFlavor::CurrentThread => {
+                    tokio_task::block_in_place(|| handle.block_on(f))
+                }
+                // Outside of any multi-threaded runtime: create one
+                // for the duration of the call.
+                _ => tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
                     .build()
-                    .unwrap()
-                    .block_on(f)
-            })
+                    .expect("failed to create tokio runtime")
+                    .block_on(f),
+            }
         }
     }
 }
